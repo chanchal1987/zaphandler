@@ -1,39 +1,53 @@
 package zaphandler
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math"
+	"runtime"
+	"sync"
 
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/exp/slog"
 )
 
-//nolint:gochecknoglobals
-var labelMap = map[slog.Level]zapcore.Level{
-	slog.DebugLevel: zapcore.DebugLevel,
-	slog.InfoLevel:  zapcore.InfoLevel,
-	slog.WarnLevel:  zapcore.WarnLevel,
-	slog.ErrorLevel: zapcore.ErrorLevel,
+func level(lvl slog.Level) (zapcore.Level, bool) {
+	val, found := map[slog.Level]zapcore.Level{
+		slog.LevelDebug: zapcore.DebugLevel,
+		slog.LevelInfo:  zapcore.InfoLevel,
+		slog.LevelWarn:  zapcore.WarnLevel,
+		slog.LevelError: zapcore.ErrorLevel,
+	}[lvl]
+
+	return val, found
 }
 
-//nolint:gochecknoglobals
-var typeMap = map[slog.Kind]zapcore.FieldType{
-	slog.BoolKind:     zapcore.BoolType,
-	slog.DurationKind: zapcore.DurationType,
-	slog.Float64Kind:  zapcore.Float64Type,
-	slog.Int64Kind:    zapcore.Int64Type,
-	slog.StringKind:   zapcore.StringType,
-	slog.TimeKind:     zapcore.TimeType,
-	slog.Uint64Kind:   zapcore.Uint64Type,
+func fieldType(kind slog.Kind) (zapcore.FieldType, bool) {
+	val, found := map[slog.Kind]zapcore.FieldType{
+		slog.KindBool:     zapcore.BoolType,
+		slog.KindDuration: zapcore.DurationType,
+		slog.KindFloat64:  zapcore.Float64Type,
+		slog.KindInt64:    zapcore.Int64Type,
+		slog.KindString:   zapcore.StringType,
+		slog.KindTime:     zapcore.TimeType,
+		slog.KindUint64:   zapcore.Uint64Type,
+	}[kind]
+
+	return val, found
 }
+
+var ErrInternal = errors.New("internal error")
 
 var _ slog.Handler = (*ZapHandler)(nil)
 
 type ZapHandler struct {
-	prefix    string
-	core      zapcore.Core
-	errOutput zapcore.WriteSyncer
-	config    Config
+	prefix     string
+	core       zapcore.Core
+	errOutput  zapcore.WriteSyncer
+	config     Config
+	stackPool  *sync.Pool
+	fieldsPool *sync.Pool
 }
 
 func NewFromCore(core zapcore.Core) *ZapHandler {
@@ -48,61 +62,104 @@ func New(logger interface{ Core() zapcore.Core }) *ZapHandler {
 // The handler ignores records whose level is lower.
 // Enabled is called early, before any arguments are processed,
 // to save effort if the log event should be discarded.
-func (hand *ZapHandler) Enabled(level slog.Level) bool {
-	return hand.core.Enabled(labelMap[level])
+func (hand *ZapHandler) Enabled(_ context.Context, l slog.Level) bool {
+	if v, ok := level(l); ok {
+		return hand.core.Enabled(v)
+	}
+
+	return false
+}
+
+func (hand *ZapHandler) frame(caller uintptr) (runtime.Frame, error) {
+	stack, ok := hand.stackPool.Get().(*stacktrace)
+	if !ok {
+		return runtime.Frame{}, fmt.Errorf("%w: invalid stack from pool", ErrInternal)
+	}
+
+	defer hand.stackPool.Put(stack)
+
+	return stack.Frame(caller), nil
+}
+
+func (hand *ZapHandler) withFields(fieldFunc func([]zapcore.Field) error) error {
+	fields, ok := hand.fieldsPool.Get().(*fields)
+	if !ok {
+		return fmt.Errorf("%w: invalid field from pool", ErrInternal)
+	}
+
+	defer hand.fieldsPool.Put(fields)
+
+	return fieldFunc(fields.fields[:0])
 }
 
 // Handle handles the Record.
 // It will only be called if Enabled returns true.
-func (hand *ZapHandler) Handle(rec slog.Record) error {
-	var stack string
-	if hand.config.StackF != nil {
-		stack = hand.config.StackF(rec.Level)
+func (hand *ZapHandler) Handle(ctx context.Context, rec slog.Record) error {
+	err := ctx.Err()
+	if err != nil {
+		return fmt.Errorf("error from context: %w", err)
 	}
 
-	fields := make([]zapcore.Field, 0, rec.NumAttrs())
-	rec.Attrs(func(attr slog.Attr) {
-		fields = hand.appendAttr(fields, attr, "")
-	})
-
-	var Caller zapcore.EntryCaller
+	var frame runtime.Frame
 	if hand.config.AddSource {
-		Caller.Defined = true
-		Caller.File, Caller.Line = rec.SourceLine()
+		frame, err = hand.frame(rec.PC)
+		if err != nil {
+			return err
+		}
 	}
 
-	checkedCore := hand.core.Check(zapcore.Entry{
-		Level:      labelMap[rec.Level],
+	lvl := zapcore.Level(rec.Level)
+	if l, ok := level(rec.Level); ok {
+		lvl = l
+	}
+
+	entry := zapcore.Entry{
+		Level:      lvl,
 		Time:       rec.Time,
 		LoggerName: "",
 		Message:    rec.Message,
-		Caller:     Caller,
-		Stack:      stack,
-	}, nil)
-
-	if hand.errOutput != nil {
-		checkedCore.ErrorOutput = hand.errOutput
+		Caller:     zapcore.NewEntryCaller(frame.PC, frame.File, frame.Line, hand.config.AddSource),
+		Stack:      "",
 	}
 
-	checkedCore.Write(fields...)
+	checked := hand.core.Check(entry, nil)
+	if checked == nil {
+		return nil
+	}
 
-	return nil
+	return hand.withFields(func(f []zapcore.Field) error {
+		rec.Attrs(func(attr slog.Attr) {
+			f = hand.appendAttr(f, attr, "")
+		})
+
+		checked.Write(f...)
+
+		return nil
+	})
 }
 
 // WithAttrs returns a new Handler whose attributes consist of
 // both the receiver's attributes and the arguments.
 func (hand *ZapHandler) WithAttrs(attrs []slog.Attr) slog.Handler { //nolint:ireturn
-	fields := make([]zapcore.Field, 0, flatLen(attrs))
+	var fields []zapcore.Field
 
-	for _, attr := range attrs {
-		fields = hand.appendAttr(fields, attr, "")
-	}
+	_ = hand.withFields(func(f []zapcore.Field) error {
+		for _, attr := range attrs {
+			f = hand.appendAttr(f, attr, "")
+		}
+
+		copy(fields, f)
+
+		return nil
+	})
 
 	return &ZapHandler{
-		prefix:    hand.prefix,
-		core:      hand.core.With(fields),
-		errOutput: hand.errOutput,
-		config:    hand.config,
+		prefix:     hand.prefix,
+		core:       hand.core.With(fields),
+		errOutput:  hand.errOutput,
+		config:     hand.config,
+		stackPool:  hand.stackPool,
+		fieldsPool: hand.fieldsPool,
 	}
 }
 
@@ -122,10 +179,12 @@ func (hand *ZapHandler) WithAttrs(attrs []slog.Attr) slog.Handler { //nolint:ire
 //	logger.LogAttrs(slog.Group("s", slog.Int("a", 1), slog.Int("b", 2)))
 func (hand *ZapHandler) WithGroup(name string) slog.Handler { //nolint:ireturn
 	return &ZapHandler{
-		prefix:    hand.prefix + name + hand.config.GroupSeparator,
-		core:      hand.core,
-		errOutput: hand.errOutput,
-		config:    hand.config,
+		prefix:     hand.prefix + name + hand.config.GroupSeparator,
+		core:       hand.core,
+		errOutput:  hand.errOutput,
+		config:     hand.config,
+		stackPool:  hand.stackPool,
+		fieldsPool: hand.fieldsPool,
 	}
 }
 
@@ -139,12 +198,12 @@ func getType(val slog.Value) (zapcore.FieldType, int64, string, any) {
 	)
 
 	Kind := val.Kind()
-	if gotType, found := typeMap[Kind]; found {
-		Type = gotType
+	if t, found := fieldType(Kind); found {
+		Type = t
 	}
 
 	switch Kind {
-	case slog.AnyKind:
+	case slog.KindAny:
 		Interface = val.Any()
 
 		switch Interface.(type) {
@@ -153,46 +212,34 @@ func getType(val slog.Value) (zapcore.FieldType, int64, string, any) {
 		case error:
 			Type = zapcore.ErrorType
 		}
-	case slog.BoolKind:
+	case slog.KindBool:
 		if val.Bool() {
 			Integer = 1
 		}
-	case slog.DurationKind:
+	case slog.KindDuration:
 		Integer = int64(val.Duration())
-	case slog.Float64Kind:
+	case slog.KindFloat64:
 		Integer = int64(math.Float64bits(val.Float64()))
-	case slog.Int64Kind:
+	case slog.KindInt64:
 		Integer = val.Int64()
-	case slog.StringKind:
+	case slog.KindString:
 		String = val.String()
-	case slog.TimeKind:
+	case slog.KindTime:
 		t := val.Time()
 		Integer = t.UnixNano()
 		Interface = t.Location()
-	case slog.Uint64Kind:
+	case slog.KindUint64:
 		Type = zapcore.Uint64Type
 		Integer = int64(val.Uint64())
-	case slog.GroupKind:
-	case slog.LogValuerKind:
+	case slog.KindGroup:
+	case slog.KindLogValuer:
 	}
 
 	return Type, Integer, String, Interface
 }
 
-func flatLen(attrs []slog.Attr) int {
-	length := len(attrs)
-
-	for _, attr := range attrs {
-		if attr.Value.Kind() == slog.GroupKind {
-			length += flatLen(attr.Value.Group()) - 1
-		}
-	}
-
-	return length
-}
-
 func (hand *ZapHandler) appendAttr(fields []zapcore.Field, attr slog.Attr, prefix string) []zapcore.Field {
-	if attr.Value.Kind() != slog.GroupKind {
+	if attr.Value.Kind() != slog.KindGroup {
 		Type, Integer, String, Interface := getType(attr.Value)
 
 		return append(fields, zapcore.Field{
