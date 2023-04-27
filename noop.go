@@ -3,12 +3,8 @@ package zaphandler
 import (
 	"context"
 
-	"golang.org/x/exp/slog"
+	"log/slog"
 )
-
-func NewNoOp() NoOpHandler {
-	return NoOpHandler{}
-}
 
 type NoOpHandler struct{}
 

@@ -18,7 +18,7 @@ fmt: tidy
 	@echo "Formatting... Done!"
 
 lint: fmt
-	@echo "Linting..." && golangci-lint run ./...
+	@echo "Linting..." && golangci-lint run --no-config --enable-all --fix ./...
 	@echo "Linting... Done!"
 
 test: lint

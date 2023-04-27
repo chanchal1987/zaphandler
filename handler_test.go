@@ -11,43 +11,35 @@ import (
 
 	"go.mrchanchal.com/zaphandler"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
-	"golang.org/x/exp/slog"
+	"log/slog"
 )
 
-func MatchEntry(log interface{ Errorf(string, ...any) }, expected, got []observer.LoggedEntry) {
+type T interface {
+	Helper()
+	Errorf(string, ...any)
+}
+
+func MatchEntry(test T, expected, got []observer.LoggedEntry) {
+	test.Helper()
+
 	if len(expected) != len(got) {
-		log.Errorf("length of expected(%d) is not matching with got(%d)", len(expected), len(got))
-	}
-
-	equal := func(name string, expected, got any) {
-		if !reflect.DeepEqual(expected, got) {
-			log.Errorf("mismatched %s\nExpected: %+v\nGot:      %+v", name, expected, got)
-		}
-	}
-
-	emptyCaller := zapcore.EntryCaller{
-		Defined:  false,
-		PC:       0,
-		File:     "",
-		Line:     0,
-		Function: "",
+		test.Errorf("length of expected(%d) is not matching with got(%d)", len(expected), len(got))
 	}
 
 	for i := 0; i < len(expected); i++ {
-		equal("caller", expected[i].Entry.Caller.File, got[i].Entry.Caller.File)
-		expected[i].Entry.Caller = emptyCaller
-		got[i].Entry.Caller = emptyCaller
-		equal("entry", expected[i].Entry, got[i].Entry)
-		equal("context", expected[i].Context, got[i].Context)
+		if !reflect.DeepEqual(expected, got) {
+			test.Errorf("mismatched entry\nExpected: %+v\nGot:      %+v", expected, got)
+		}
 	}
 }
 
-func TakeUntimed(o *observer.ObservedLogs) []observer.LoggedEntry {
+func Take(o *observer.ObservedLogs) []observer.LoggedEntry {
 	ret := o.TakeAll()
 	for i := range ret {
 		ret[i].Time = time.Time{}
+		ret[i].Caller.PC = 1
+		ret[i].Caller.Line = 1
 	}
 
 	return ret
@@ -152,7 +144,6 @@ func BenchmarkZapHandlerWithCaller(b *testing.B) {
 			logger := slog.New(zaphandler.Config{
 				GroupSeparator: ".",
 				AddSource:      true,
-				ErrorOutput:    nil,
 			}.Build(zapL.Core()))
 
 			b.ResetTimer()
@@ -213,7 +204,6 @@ func FuzzZapHandler(f *testing.F) {
 	logger := slog.New(zaphandler.Config{
 		GroupSeparator: ".",
 		AddSource:      true,
-		ErrorOutput:    os.Stderr,
 	}.Build(core))
 
 	zapL := zap.New(core, zap.AddCaller())
@@ -227,6 +217,8 @@ func FuzzZapHandler(f *testing.F) {
 		boolF bool, int64F int64, int64F2 int64, float64F float64,
 		uint64F uint64,
 	) {
+		t.Parallel()
+
 		err := fmt.Errorf("%w: %s", errTest, msg)
 		stringer := dummyStringer(msg)
 
@@ -243,7 +235,7 @@ func FuzzZapHandler(f *testing.F) {
 			zap.Stringer("stringerF", stringer),
 		)
 
-		expected := TakeUntimed(obs)
+		expected := Take(obs)
 
 		logger.Info(msg,
 			"stringF", stringF,
@@ -258,7 +250,7 @@ func FuzzZapHandler(f *testing.F) {
 			"stringerF", stringer,
 		)
 
-		MatchEntry(t, expected, TakeUntimed(obs))
+		MatchEntry(t, expected, Take(obs))
 	})
 }
 
@@ -278,8 +270,8 @@ func TestZapHandlerGroup(t *testing.T) {
 
 	logger.WithGroup("s").LogAttrs(ctx, slog.LevelInfo, "", slog.Int("a", 1), slog.Int("b", 2))
 
-	got := TakeUntimed(obs)
+	got := Take(obs)
 
 	logger.LogAttrs(ctx, slog.LevelInfo, "", slog.Group("s", slog.Int("a", 1), slog.Int("b", 2)))
-	MatchEntry(t, TakeUntimed(obs), got)
+	MatchEntry(t, Take(obs), got)
 }

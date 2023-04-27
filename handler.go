@@ -9,7 +9,7 @@ import (
 	"sync"
 
 	"go.uber.org/zap/zapcore"
-	"golang.org/x/exp/slog"
+	"log/slog"
 )
 
 func level(lvl slog.Level) (zapcore.Level, bool) {
@@ -39,12 +39,9 @@ func fieldType(kind slog.Kind) (zapcore.FieldType, bool) {
 
 var ErrInternal = errors.New("internal error")
 
-var _ slog.Handler = (*ZapHandler)(nil)
-
 type ZapHandler struct {
 	prefix     string
 	core       zapcore.Core
-	errOutput  zapcore.WriteSyncer
 	config     Config
 	stackPool  *sync.Pool
 	fieldsPool *sync.Pool
@@ -92,20 +89,31 @@ func (hand *ZapHandler) withFields(fieldFunc func([]zapcore.Field) error) error 
 	return fieldFunc(fields.fields[:0])
 }
 
+func (hand *ZapHandler) entryCaller(caller uintptr) (zapcore.EntryCaller, error) {
+	if !hand.config.AddSource || caller == 0 {
+		//nolint:exhaustivestruct,exhaustruct
+		return zapcore.EntryCaller{}, nil
+	}
+
+	frame, err := hand.frame(caller)
+	if err != nil || frame.PC == 0 {
+		return zapcore.EntryCaller{}, err
+	}
+
+	return zapcore.EntryCaller{
+		Defined:  true,
+		PC:       frame.PC,
+		File:     frame.File,
+		Line:     frame.Line,
+		Function: frame.Function,
+	}, nil
+}
+
 // Handle handles the Record.
 // It will only be called if Enabled returns true.
 func (hand *ZapHandler) Handle(ctx context.Context, rec slog.Record) error {
-	err := ctx.Err()
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("error from context: %w", err)
-	}
-
-	var frame runtime.Frame
-	if hand.config.AddSource {
-		frame, err = hand.frame(rec.PC)
-		if err != nil {
-			return err
-		}
 	}
 
 	lvl := zapcore.Level(rec.Level)
@@ -113,28 +121,36 @@ func (hand *ZapHandler) Handle(ctx context.Context, rec slog.Record) error {
 		lvl = l
 	}
 
-	entry := zapcore.Entry{
+	caller, err := hand.entryCaller(rec.PC)
+	if err != nil {
+		return err
+	}
+
+	checked := hand.core.Check(zapcore.Entry{
 		Level:      lvl,
 		Time:       rec.Time,
 		LoggerName: "",
 		Message:    rec.Message,
-		Caller:     zapcore.NewEntryCaller(frame.PC, frame.File, frame.Line, hand.config.AddSource),
+		Caller:     caller,
 		Stack:      "",
-	}
-
-	checked := hand.core.Check(entry, nil)
+	}, nil)
 	if checked == nil {
 		return nil
 	}
 
-	return hand.withFields(func(f []zapcore.Field) error {
-		rec.Attrs(func(attr slog.Attr) {
-			f = hand.appendAttr(f, attr, "")
+	var errOut Error
+	checked.ErrorOutput = &errOut
+
+	return hand.withFields(func(field []zapcore.Field) error {
+		rec.Attrs(func(attr slog.Attr) bool {
+			field = hand.appendAttr(field, attr, "")
+
+			return true
 		})
 
-		checked.Write(f...)
+		checked.Write(field...)
 
-		return nil
+		return errOut.Err()
 	})
 }
 
@@ -156,7 +172,6 @@ func (hand *ZapHandler) WithAttrs(attrs []slog.Attr) slog.Handler { //nolint:ire
 	return &ZapHandler{
 		prefix:     hand.prefix,
 		core:       hand.core.With(fields),
-		errOutput:  hand.errOutput,
 		config:     hand.config,
 		stackPool:  hand.stackPool,
 		fieldsPool: hand.fieldsPool,
@@ -181,7 +196,6 @@ func (hand *ZapHandler) WithGroup(name string) slog.Handler { //nolint:ireturn
 	return &ZapHandler{
 		prefix:     hand.prefix + name + hand.config.GroupSeparator,
 		core:       hand.core,
-		errOutput:  hand.errOutput,
 		config:     hand.config,
 		stackPool:  hand.stackPool,
 		fieldsPool: hand.fieldsPool,
