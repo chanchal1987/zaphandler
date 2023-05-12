@@ -141,10 +141,9 @@ func BenchmarkZapHandlerWithCaller(b *testing.B) {
 				}
 			}()
 
-			logger := slog.New(zaphandler.Config{
-				GroupSeparator: ".",
-				AddSource:      true,
-			}.Build(zapL.Core()))
+			hand := zaphandler.New(zapL)
+			hand.AddSource = true
+			logger := slog.New(hand)
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
@@ -201,10 +200,9 @@ func FuzzZapHandler(f *testing.F) {
 		}
 	}()
 
-	logger := slog.New(zaphandler.Config{
-		GroupSeparator: ".",
-		AddSource:      true,
-	}.Build(core))
+	hand := zaphandler.NewFromCore(core)
+	hand.AddSource = true
+	logger := slog.New(hand)
 
 	zapL := zap.New(core, zap.AddCaller())
 

@@ -12,6 +12,19 @@ import (
 	"log/slog"
 )
 
+const initFieldPoolSize = 32
+
+type stacktrace struct{ pc [1]uintptr }
+
+func (ss *stacktrace) Frame(pc uintptr) runtime.Frame {
+	ss.pc[0] = pc
+	f, _ := runtime.CallersFrames(ss.pc[:]).Next()
+
+	return f
+}
+
+type fields struct{ fields []zapcore.Field }
+
 func level(lvl slog.Level) (zapcore.Level, bool) {
 	val, found := map[slog.Level]zapcore.Level{
 		slog.LevelDebug: zapcore.DebugLevel,
@@ -40,15 +53,23 @@ func fieldType(kind slog.Kind) (zapcore.FieldType, bool) {
 var ErrInternal = errors.New("internal error")
 
 type ZapHandler struct {
-	prefix     string
-	core       zapcore.Core
-	config     Config
-	stackPool  *sync.Pool
-	fieldsPool *sync.Pool
+	GroupSeparator string
+	AddSource      bool
+	prefix         string
+	core           zapcore.Core
+	stackPool      *sync.Pool
+	fieldsPool     *sync.Pool
 }
 
 func NewFromCore(core zapcore.Core) *ZapHandler {
-	return DefaultConfig().Build(core)
+	return &ZapHandler{
+		GroupSeparator: ".",
+		AddSource:      false,
+		prefix:         "",
+		core:           core,
+		stackPool:      &sync.Pool{New: func() any { return &stacktrace{pc: [1]uintptr{}} }},
+		fieldsPool:     &sync.Pool{New: func() any { return &fields{fields: make([]zapcore.Field, 0, initFieldPoolSize)} }},
+	}
 }
 
 func New(logger interface{ Core() zapcore.Core }) *ZapHandler {
@@ -90,7 +111,7 @@ func (hand *ZapHandler) withFields(fieldFunc func([]zapcore.Field) error) error 
 }
 
 func (hand *ZapHandler) entryCaller(caller uintptr) (zapcore.EntryCaller, error) {
-	if !hand.config.AddSource || caller == 0 {
+	if !hand.AddSource || caller == 0 {
 		//nolint:exhaustivestruct,exhaustruct
 		return zapcore.EntryCaller{}, nil
 	}
@@ -170,11 +191,12 @@ func (hand *ZapHandler) WithAttrs(attrs []slog.Attr) slog.Handler { //nolint:ire
 	})
 
 	return &ZapHandler{
-		prefix:     hand.prefix,
-		core:       hand.core.With(fields),
-		config:     hand.config,
-		stackPool:  hand.stackPool,
-		fieldsPool: hand.fieldsPool,
+		GroupSeparator: hand.GroupSeparator,
+		AddSource:      hand.AddSource,
+		prefix:         hand.prefix,
+		core:           hand.core.With(fields),
+		stackPool:      hand.stackPool,
+		fieldsPool:     hand.fieldsPool,
 	}
 }
 
@@ -194,11 +216,12 @@ func (hand *ZapHandler) WithAttrs(attrs []slog.Attr) slog.Handler { //nolint:ire
 //	logger.LogAttrs(slog.Group("s", slog.Int("a", 1), slog.Int("b", 2)))
 func (hand *ZapHandler) WithGroup(name string) slog.Handler { //nolint:ireturn
 	return &ZapHandler{
-		prefix:     hand.prefix + name + hand.config.GroupSeparator,
-		core:       hand.core,
-		config:     hand.config,
-		stackPool:  hand.stackPool,
-		fieldsPool: hand.fieldsPool,
+		GroupSeparator: hand.GroupSeparator,
+		AddSource:      hand.AddSource,
+		prefix:         hand.prefix + name + hand.GroupSeparator,
+		core:           hand.core,
+		stackPool:      hand.stackPool,
+		fieldsPool:     hand.fieldsPool,
 	}
 }
 
@@ -266,7 +289,7 @@ func (hand *ZapHandler) appendAttr(fields []zapcore.Field, attr slog.Attr, prefi
 	}
 
 	for _, gAttr := range attr.Value.Group() {
-		fields = hand.appendAttr(fields, gAttr, prefix+attr.Key+hand.config.GroupSeparator)
+		fields = hand.appendAttr(fields, gAttr, prefix+attr.Key+hand.GroupSeparator)
 	}
 
 	return fields
