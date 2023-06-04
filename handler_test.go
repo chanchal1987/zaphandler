@@ -11,25 +11,21 @@ import (
 
 	"go.mrchanchal.com/zaphandler"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 	"log/slog"
 )
 
-type T interface {
-	Helper()
-	Errorf(string, ...any)
-}
-
-func MatchEntry(test T, expected, got []observer.LoggedEntry) {
-	test.Helper()
+func MatchEntry(tb testing.TB, expected, got []observer.LoggedEntry) {
+	tb.Helper()
 
 	if len(expected) != len(got) {
-		test.Errorf("length of expected(%d) is not matching with got(%d)", len(expected), len(got))
+		tb.Errorf("length of expected(%d) is not matching with got(%d)", len(expected), len(got))
 	}
 
 	for i := 0; i < len(expected); i++ {
 		if !reflect.DeepEqual(expected, got) {
-			test.Errorf("mismatched entry\nExpected: %+v\nGot:      %+v", expected, got)
+			tb.Errorf("mismatched entry\nExpected: %+v\nGot:      %+v", expected, got)
 		}
 	}
 }
@@ -43,6 +39,12 @@ func Take(o *observer.ObservedLogs) []observer.LoggedEntry {
 	}
 
 	return ret
+}
+
+func ObsLogger(lvl zapcore.LevelEnabler) (*slog.Logger, *zap.Logger, *observer.ObservedLogs) {
+	core, obs := observer.New(lvl)
+
+	return slog.New(zaphandler.NewFromCore(core)), zap.New(core), obs
 }
 
 func BenchData() []struct {
@@ -250,6 +252,19 @@ func FuzzZapHandler(f *testing.F) {
 
 		MatchEntry(t, expected, Take(obs))
 	})
+}
+
+func TestWith(t *testing.T) {
+	t.Parallel()
+
+	logger, _, obs := ObsLogger(zap.DebugLevel)
+
+	logger.Info("test", "test-field", "test-value")
+
+	got := Take(obs)
+
+	logger.With("test-field", "test-value").Info("test")
+	MatchEntry(t, Take(obs), got)
 }
 
 func TestZapHandlerGroup(t *testing.T) {

@@ -14,13 +14,19 @@ import (
 
 const initFieldPoolSize = 32
 
-type stacktrace struct{ pc [1]uintptr }
+var ErrInternal = errors.New("internal error, please report a bug")
 
-func (ss *stacktrace) Frame(pc uintptr) runtime.Frame {
+type stacktrace struct{ pc []uintptr }
+
+func (ss *stacktrace) Frame(pc uintptr) (runtime.Frame, error) {
+	if len(ss.pc) != 1 {
+		return runtime.Frame{}, fmt.Errorf("%w: invalid stack length from pool", ErrInternal)
+	}
+
 	ss.pc[0] = pc
-	f, _ := runtime.CallersFrames(ss.pc[:]).Next()
+	f, _ := runtime.CallersFrames(ss.pc).Next()
 
-	return f
+	return f, nil
 }
 
 type fields struct{ fields []zapcore.Field }
@@ -45,12 +51,11 @@ func fieldType(kind slog.Kind) (zapcore.FieldType, bool) {
 		slog.KindString:   zapcore.StringType,
 		slog.KindTime:     zapcore.TimeType,
 		slog.KindUint64:   zapcore.Uint64Type,
+		slog.KindGroup:    zapcore.NamespaceType,
 	}[kind]
 
 	return val, found
 }
-
-var ErrInternal = errors.New("internal error")
 
 type ZapHandler struct {
 	GroupSeparator string
@@ -67,7 +72,7 @@ func NewFromCore(core zapcore.Core) *ZapHandler {
 		AddSource:      false,
 		prefix:         "",
 		core:           core,
-		stackPool:      &sync.Pool{New: func() any { return &stacktrace{pc: [1]uintptr{}} }},
+		stackPool:      &sync.Pool{New: func() any { return &stacktrace{pc: make([]uintptr, 1)} }},
 		fieldsPool:     &sync.Pool{New: func() any { return &fields{fields: make([]zapcore.Field, 0, initFieldPoolSize)} }},
 	}
 }
@@ -76,10 +81,19 @@ func New(logger interface{ Core() zapcore.Core }) *ZapHandler {
 	return NewFromCore(logger.Core())
 }
 
+func (hand *ZapHandler) clone() ZapHandler {
+	return *hand
+}
+
 // Enabled reports whether the handler handles records at the given level.
 // The handler ignores records whose level is lower.
-// Enabled is called early, before any arguments are processed,
+// It is called early, before any arguments are processed,
 // to save effort if the log event should be discarded.
+// If called from a Logger method, the first argument is the context
+// passed to that method, or context.Background() if nil was passed
+// or the method does not take a context.
+// The context is passed so Enabled can use its values
+// to make a decision.
 func (hand *ZapHandler) Enabled(_ context.Context, l slog.Level) bool {
 	if v, ok := level(l); ok {
 		return hand.core.Enabled(v)
@@ -96,7 +110,7 @@ func (hand *ZapHandler) frame(caller uintptr) (runtime.Frame, error) {
 
 	defer hand.stackPool.Put(stack)
 
-	return stack.Frame(caller), nil
+	return stack.Frame(caller)
 }
 
 func (hand *ZapHandler) withFields(fieldFunc func([]zapcore.Field) error) error {
@@ -111,8 +125,8 @@ func (hand *ZapHandler) withFields(fieldFunc func([]zapcore.Field) error) error 
 }
 
 func (hand *ZapHandler) entryCaller(caller uintptr) (zapcore.EntryCaller, error) {
+	// If caller is zero, ignore it.
 	if !hand.AddSource || caller == 0 {
-		//nolint:exhaustivestruct,exhaustruct
 		return zapcore.EntryCaller{}, nil
 	}
 
@@ -131,7 +145,22 @@ func (hand *ZapHandler) entryCaller(caller uintptr) (zapcore.EntryCaller, error)
 }
 
 // Handle handles the Record.
-// It will only be called if Enabled returns true.
+// It will only be called when Enabled returns true.
+// The Context argument is as for Enabled.
+// It is present solely to provide Handlers access to the context's values.
+// Canceling the context should not affect record processing.
+// (Among other things, log messages may be necessary to debug a
+// cancellation-related problem.)
+//
+// Handle methods that produce output should observe the following rules:
+//   - If r.Time is the zero time, ignore the time.
+//   - If r.PC is zero, ignore it.
+//   - Attr's values should be resolved.
+//   - If an Attr's key and value are both the zero value, ignore the Attr.
+//     This can be tested with attr.Equal(Attr{}).
+//   - If a group's key is empty, inline the group's Attrs.
+//   - If a group has no Attrs (even if it has a non-empty key),
+//     ignore it.
 func (hand *ZapHandler) Handle(ctx context.Context, rec slog.Record) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("error from context: %w", err)
@@ -177,27 +206,21 @@ func (hand *ZapHandler) Handle(ctx context.Context, rec slog.Record) error {
 
 // WithAttrs returns a new Handler whose attributes consist of
 // both the receiver's attributes and the arguments.
-func (hand *ZapHandler) WithAttrs(attrs []slog.Attr) slog.Handler { //nolint:ireturn
-	var fields []zapcore.Field
+// The Handler owns the slice: it may retain, modify or discard it.
+func (hand *ZapHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	cloned := hand.clone()
 
 	_ = hand.withFields(func(f []zapcore.Field) error {
 		for _, attr := range attrs {
 			f = hand.appendAttr(f, attr, "")
 		}
 
-		copy(fields, f)
+		cloned.core = cloned.core.With(f)
 
 		return nil
 	})
 
-	return &ZapHandler{
-		GroupSeparator: hand.GroupSeparator,
-		AddSource:      hand.AddSource,
-		prefix:         hand.prefix,
-		core:           hand.core.With(fields),
-		stackPool:      hand.stackPool,
-		fieldsPool:     hand.fieldsPool,
-	}
+	return &cloned
 }
 
 // WithGroup returns a new Handler with the given group appended to
@@ -209,20 +232,26 @@ func (hand *ZapHandler) WithAttrs(attrs []slog.Attr) slog.Handler { //nolint:ire
 // this Handler's attribute keys differ from those of another Handler
 // with a different sequence of group names.
 //
-//	logger.WithGroup("s").LogAttrs(slog.Int("a", 1), slog.Int("b", 2))
+// A Handler should treat WithGroup as starting a Group of Attrs that ends
+// at the end of the log event. That is,
 //
-// will behave like
+//	logger.WithGroup("s").LogAttrs(level, msg, slog.Int("a", 1), slog.Int("b", 2))
 //
-//	logger.LogAttrs(slog.Group("s", slog.Int("a", 1), slog.Int("b", 2)))
-func (hand *ZapHandler) WithGroup(name string) slog.Handler { //nolint:ireturn
-	return &ZapHandler{
-		GroupSeparator: hand.GroupSeparator,
-		AddSource:      hand.AddSource,
-		prefix:         hand.prefix + name + hand.GroupSeparator,
-		core:           hand.core,
-		stackPool:      hand.stackPool,
-		fieldsPool:     hand.fieldsPool,
+// should behave like
+//
+//	logger.LogAttrs(level, msg, slog.Group("s", slog.Int("a", 1), slog.Int("b", 2)))
+//
+// If the name is empty, WithGroup returns the receiver.
+func (hand *ZapHandler) WithGroup(name string) slog.Handler {
+	// If the name is empty, WithGroup returns the receiver.
+	if name == "" {
+		return hand
 	}
+
+	cloned := hand.clone()
+	cloned.prefix = hand.prefix + name + hand.GroupSeparator
+
+	return &cloned
 }
 
 //nolint:cyclop
@@ -276,21 +305,34 @@ func getType(val slog.Value) (zapcore.FieldType, int64, string, any) {
 }
 
 func (hand *ZapHandler) appendAttr(fields []zapcore.Field, attr slog.Attr, prefix string) []zapcore.Field {
-	if attr.Value.Kind() != slog.KindGroup {
-		Type, Integer, String, Interface := getType(attr.Value)
-
-		return append(fields, zapcore.Field{
-			Key:       hand.prefix + prefix + attr.Key,
-			Type:      Type,
-			Integer:   Integer,
-			String:    String,
-			Interface: Interface,
-		})
+	// If an Attr's key and value are both the zero value, ignore the Attr. This can be tested with attr.Equal(Attr{}).
+	if attr.Equal(slog.Attr{}) {
+		return fields
 	}
 
-	for _, gAttr := range attr.Value.Group() {
-		fields = hand.appendAttr(fields, gAttr, prefix+attr.Key+hand.GroupSeparator)
+	if attr.Value.Kind() == slog.KindGroup {
+		var addPrefix string
+
+		// If a group's key is empty, inline the group's Attrs.
+		if attr.Key != "" {
+			addPrefix = attr.Key + hand.GroupSeparator
+		}
+
+		// If a group has no Attrs (even if it has a non-empty key), ignore it.
+		for _, gAttr := range attr.Value.Group() {
+			fields = hand.appendAttr(fields, gAttr, prefix+addPrefix)
+		}
+
+		return fields
 	}
 
-	return fields
+	Type, Integer, String, Interface := getType(attr.Value)
+
+	return append(fields, zapcore.Field{
+		Key:       hand.prefix + prefix + attr.Key,
+		Type:      Type,
+		Integer:   Integer,
+		String:    String,
+		Interface: Interface,
+	})
 }

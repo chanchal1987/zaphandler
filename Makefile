@@ -1,3 +1,5 @@
+FUZZ_TIME=20s
+
 default: all
 
 all: test
@@ -18,11 +20,23 @@ fmt: tidy
 	@echo "Formatting... Done!"
 
 lint: fmt
-	@echo "Linting..." && golangci-lint run --no-config --enable-all --fix ./...
+	@echo "Linting..." && golangci-lint run --no-config --fix --enable-all \
+		--disable exhaustivestruct \
+		--disable exhaustruct \
+		--disable ireturn \
+		./...
 	@echo "Linting... Done!"
 
 test: lint
 	@echo "Testing..." && go test -race -v ./...
 	@echo "Testing... Done!"
 
-.PHONY: default all tidy fmt lint test
+fuzz:
+	@echo "Fuzzing..." && go test -fuzz 'Fuzz*' -fuzztime ${FUZZ_TIME} ./...
+	@echo "Fuzzing... Done"
+
+bench:
+	@echo "Benchmarking..." && go test -bench 'Bench*' -benchmem ./...
+	@echo "Benchmarking... Done"
+
+.PHONY: default all tidy fmt lint test fuzz bench
