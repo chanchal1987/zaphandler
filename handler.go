@@ -2,34 +2,14 @@ package zaphandler
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"math"
-	"runtime"
-	"sync"
-
-	"go.uber.org/zap/zapcore"
 	"log/slog"
+
+	"go.mrchanchal.com/zaphandler/types"
+	"go.uber.org/zap/zapcore"
 )
 
-const initFieldPoolSize = 32
-
-var ErrInternal = errors.New("internal error, please report a bug")
-
-type stacktrace struct{ pc []uintptr }
-
-func (ss *stacktrace) Frame(pc uintptr) (runtime.Frame, error) {
-	if len(ss.pc) != 1 {
-		return runtime.Frame{}, fmt.Errorf("%w: invalid stack length from pool", ErrInternal)
-	}
-
-	ss.pc[0] = pc
-	f, _ := runtime.CallersFrames(ss.pc).Next()
-
-	return f, nil
-}
-
-type fields struct{ fields []zapcore.Field }
+const ErrorKey = "error"
 
 func level(lvl slog.Level) (zapcore.Level, bool) {
 	val, found := map[slog.Level]zapcore.Level{
@@ -42,43 +22,29 @@ func level(lvl slog.Level) (zapcore.Level, bool) {
 	return val, found
 }
 
-func fieldType(kind slog.Kind) (zapcore.FieldType, bool) {
-	val, found := map[slog.Kind]zapcore.FieldType{
-		slog.KindBool:     zapcore.BoolType,
-		slog.KindDuration: zapcore.DurationType,
-		slog.KindFloat64:  zapcore.Float64Type,
-		slog.KindInt64:    zapcore.Int64Type,
-		slog.KindString:   zapcore.StringType,
-		slog.KindTime:     zapcore.TimeType,
-		slog.KindUint64:   zapcore.Uint64Type,
-		slog.KindGroup:    zapcore.NamespaceType,
-	}[kind]
+type Option func(*ZapHandler)
 
-	return val, found
-}
+func AddSource() Option { return func(h *ZapHandler) { h.AddSource = true } }
 
 type ZapHandler struct {
-	GroupSeparator string
-	AddSource      bool
-	prefix         string
-	core           zapcore.Core
-	stackPool      *sync.Pool
-	fieldsPool     *sync.Pool
+	AddSource bool
+	groups    []string
+	core      zapcore.Core
+	pool      *poolT
 }
 
-func NewFromCore(core zapcore.Core) *ZapHandler {
-	return &ZapHandler{
-		GroupSeparator: ".",
-		AddSource:      false,
-		prefix:         "",
-		core:           core,
-		stackPool:      &sync.Pool{New: func() any { return &stacktrace{pc: make([]uintptr, 1)} }},
-		fieldsPool:     &sync.Pool{New: func() any { return &fields{fields: make([]zapcore.Field, 0, initFieldPoolSize)} }},
+func NewFromCore(core zapcore.Core, options ...Option) *ZapHandler {
+	hand := ZapHandler{core: core, pool: newPool()}
+
+	for _, opt := range options {
+		opt(&hand)
 	}
+
+	return &hand
 }
 
-func New(logger interface{ Core() zapcore.Core }) *ZapHandler {
-	return NewFromCore(logger.Core())
+func New(logger interface{ Core() zapcore.Core }, options ...Option) *ZapHandler {
+	return NewFromCore(logger.Core(), options...)
 }
 
 func (hand *ZapHandler) clone() ZapHandler {
@@ -100,48 +66,6 @@ func (hand *ZapHandler) Enabled(_ context.Context, l slog.Level) bool {
 	}
 
 	return false
-}
-
-func (hand *ZapHandler) frame(caller uintptr) (runtime.Frame, error) {
-	stack, ok := hand.stackPool.Get().(*stacktrace)
-	if !ok {
-		return runtime.Frame{}, fmt.Errorf("%w: invalid stack from pool", ErrInternal)
-	}
-
-	defer hand.stackPool.Put(stack)
-
-	return stack.Frame(caller)
-}
-
-func (hand *ZapHandler) withFields(fieldFunc func([]zapcore.Field) error) error {
-	fields, ok := hand.fieldsPool.Get().(*fields)
-	if !ok {
-		return fmt.Errorf("%w: invalid field from pool", ErrInternal)
-	}
-
-	defer hand.fieldsPool.Put(fields)
-
-	return fieldFunc(fields.fields[:0])
-}
-
-func (hand *ZapHandler) entryCaller(caller uintptr) (zapcore.EntryCaller, error) {
-	// If caller is zero, ignore it.
-	if !hand.AddSource || caller == 0 {
-		return zapcore.EntryCaller{}, nil
-	}
-
-	frame, err := hand.frame(caller)
-	if err != nil || frame.PC == 0 {
-		return zapcore.EntryCaller{}, err
-	}
-
-	return zapcore.EntryCaller{
-		Defined:  true,
-		PC:       frame.PC,
-		File:     frame.File,
-		Line:     frame.Line,
-		Function: frame.Function,
-	}, nil
 }
 
 // Handle handles the Record.
@@ -171,18 +95,11 @@ func (hand *ZapHandler) Handle(ctx context.Context, rec slog.Record) error {
 		lvl = l
 	}
 
-	caller, err := hand.entryCaller(rec.PC)
-	if err != nil {
-		return err
-	}
-
 	checked := hand.core.Check(zapcore.Entry{
-		Level:      lvl,
-		Time:       rec.Time,
-		LoggerName: "",
-		Message:    rec.Message,
-		Caller:     caller,
-		Stack:      "",
+		Level:   lvl,
+		Time:    rec.Time,
+		Message: rec.Message,
+		Caller:  hand.pool.caller(rec.PC, hand.AddSource),
 	}, nil)
 	if checked == nil {
 		return nil
@@ -191,17 +108,42 @@ func (hand *ZapHandler) Handle(ctx context.Context, rec slog.Record) error {
 	var errOut Error
 	checked.ErrorOutput = &errOut
 
-	return hand.withFields(func(field []zapcore.Field) error {
-		rec.Attrs(func(attr slog.Attr) bool {
-			field = hand.appendAttr(field, attr, "")
+	hand.write(rec, checked)
 
-			return true
+	return errOut.Err()
+}
+
+func (hand *ZapHandler) write(rec slog.Record, checked *zapcore.CheckedEntry) {
+	if len(hand.groups) == 0 {
+		hand.pool.withFields(func(field []zapcore.Field) {
+			rec.Attrs(func(attr slog.Attr) bool {
+				field = hand.appendAttr(field, attr)
+
+				return true
+			})
+
+			checked.Write(field...)
 		})
+	} else {
+		hand.pool.withAttrs(func(attrs []slog.Attr) {
+			rec.Attrs(func(attr slog.Attr) bool {
+				attrs = append(attrs, attr)
 
-		checked.Write(field...)
+				return true
+			})
 
-		return errOut.Err()
-	})
+			grp := slog.Attr{
+				Key:   hand.groups[len(hand.groups)-1],
+				Value: slog.GroupValue(attrs...),
+			}
+
+			for i := len(hand.groups) - 1 - 1; i >= 0; i-- {
+				grp = slog.Group(hand.groups[i], grp)
+			}
+
+			checked.Write(types.NewFieldType(grp.Value).Field(grp.Key))
+		})
+	}
 }
 
 // WithAttrs returns a new Handler whose attributes consist of
@@ -210,14 +152,12 @@ func (hand *ZapHandler) Handle(ctx context.Context, rec slog.Record) error {
 func (hand *ZapHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	cloned := hand.clone()
 
-	_ = hand.withFields(func(f []zapcore.Field) error {
+	hand.pool.withFields(func(f []zapcore.Field) {
 		for _, attr := range attrs {
-			f = hand.appendAttr(f, attr, "")
+			f = hand.appendAttr(f, attr)
 		}
 
 		cloned.core = cloned.core.With(f)
-
-		return nil
 	})
 
 	return &cloned
@@ -249,90 +189,25 @@ func (hand *ZapHandler) WithGroup(name string) slog.Handler {
 	}
 
 	cloned := hand.clone()
-	cloned.prefix = hand.prefix + name + hand.GroupSeparator
+	cloned.groups = append(cloned.groups, name)
 
 	return &cloned
 }
 
-//nolint:cyclop
-func getType(val slog.Value) (zapcore.FieldType, int64, string, any) {
-	var (
-		Type      = zapcore.ReflectType
-		Integer   = int64(0)
-		String    = ""
-		Interface = any(nil)
-	)
-
-	Kind := val.Kind()
-	if t, found := fieldType(Kind); found {
-		Type = t
-	}
-
-	switch Kind {
-	case slog.KindAny:
-		Interface = val.Any()
-
-		switch Interface.(type) {
-		case fmt.Stringer:
-			Type = zapcore.StringerType
-		case error:
-			Type = zapcore.ErrorType
-		}
-	case slog.KindBool:
-		if val.Bool() {
-			Integer = 1
-		}
-	case slog.KindDuration:
-		Integer = int64(val.Duration())
-	case slog.KindFloat64:
-		Integer = int64(math.Float64bits(val.Float64()))
-	case slog.KindInt64:
-		Integer = val.Int64()
-	case slog.KindString:
-		String = val.String()
-	case slog.KindTime:
-		t := val.Time()
-		Integer = t.UnixNano()
-		Interface = t.Location()
-	case slog.KindUint64:
-		Type = zapcore.Uint64Type
-		Integer = int64(val.Uint64())
-	case slog.KindGroup:
-	case slog.KindLogValuer:
-	}
-
-	return Type, Integer, String, Interface
-}
-
-func (hand *ZapHandler) appendAttr(fields []zapcore.Field, attr slog.Attr, prefix string) []zapcore.Field {
-	// If an Attr's key and value are both the zero value, ignore the Attr. This can be tested with attr.Equal(Attr{}).
+func (hand *ZapHandler) appendAttr(fields []zapcore.Field, attr slog.Attr) []zapcore.Field {
+	// If an Attr's key and value are both the zero value, ignore the Attr.
 	if attr.Equal(slog.Attr{}) {
 		return fields
 	}
 
-	if attr.Value.Kind() == slog.KindGroup {
-		var addPrefix string
-
-		// If a group's key is empty, inline the group's Attrs.
-		if attr.Key != "" {
-			addPrefix = attr.Key + hand.GroupSeparator
-		}
-
-		// If a group has no Attrs (even if it has a non-empty key), ignore it.
-		for _, gAttr := range attr.Value.Group() {
-			fields = hand.appendAttr(fields, gAttr, prefix+addPrefix)
+	// If a group's key is empty, inline the group's Attrs.
+	if attr.Value.Kind() == slog.KindGroup && attr.Key == "" {
+		for _, a := range attr.Value.Group() {
+			fields = hand.appendAttr(fields, a)
 		}
 
 		return fields
 	}
 
-	Type, Integer, String, Interface := getType(attr.Value)
-
-	return append(fields, zapcore.Field{
-		Key:       hand.prefix + prefix + attr.Key,
-		Type:      Type,
-		Integer:   Integer,
-		String:    String,
-		Interface: Interface,
-	})
+	return append(fields, types.NewFieldType(attr.Value).Field(attr.Key))
 }

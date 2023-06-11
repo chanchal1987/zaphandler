@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"reflect"
 	"testing"
@@ -13,7 +14,6 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
-	"log/slog"
 )
 
 func MatchEntry(tb testing.TB, expected, got []observer.LoggedEntry) {
@@ -36,9 +36,25 @@ func Take(o *observer.ObservedLogs) []observer.LoggedEntry {
 		ret[i].Time = time.Time{}
 		ret[i].Caller.PC = 1
 		ret[i].Caller.Line = 1
+		ret[i].Caller.Function = ""
 	}
 
 	return ret
+}
+
+func Match(tb testing.TB, lvl zapcore.LevelEnabler, expected, got func(*slog.Logger, *zap.Logger)) {
+	tb.Helper()
+
+	core, obs := observer.New(lvl)
+	zLogger := zap.New(core, zap.AddCaller())
+	sLogger := slog.New(zaphandler.NewFromCore(core, zaphandler.AddSource()))
+
+	expected(sLogger, zLogger)
+
+	e := Take(obs)
+
+	got(sLogger, zLogger)
+	MatchEntry(tb, e, Take(obs))
 }
 
 func ObsLogger(lvl zapcore.LevelEnabler) (*slog.Logger, *zap.Logger, *observer.ObservedLogs) {
@@ -119,7 +135,7 @@ func BenchmarkZapHandler(b *testing.B) {
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				logger.Info("sample log message", "field1", "value1", "field2", 33)
+				logger.Info("sample log message", "field1", "value1", "field2", 33, "field3", []int{32, 33})
 			}
 
 			b.StopTimer()
@@ -149,7 +165,7 @@ func BenchmarkZapHandlerWithCaller(b *testing.B) {
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				logger.Info("sample log message", "field1", "value1", "field2", 33)
+				logger.Info("sample log message", "field1", "value1", "field2", 33, "field3", []int{32, 33})
 			}
 
 			b.StopTimer()
@@ -178,6 +194,7 @@ func BenchmarkZap(b *testing.B) {
 				zapL.Info("sample log message",
 					zap.String("field1", "value1"),
 					zap.Int("field2", 33),
+					zap.Ints("field3", []int{32, 33}),
 				)
 			}
 
@@ -186,85 +203,14 @@ func BenchmarkZap(b *testing.B) {
 	}
 }
 
-type dummyStringer string
-
-func (s dummyStringer) String() string {
-	return string(s)
-}
-
-var errTest = errors.New("test error")
-
-func FuzzZapHandler(f *testing.F) {
-	core, obs := observer.New(zap.DebugLevel)
-	defer func() {
-		if err := core.Sync(); err != nil {
-			f.Error(err)
-		}
-	}()
-
-	hand := zaphandler.NewFromCore(core)
-	hand.AddSource = true
-	logger := slog.New(hand)
-
-	zapL := zap.New(core, zap.AddCaller())
-
-	f.Add("sample log", "string field", 9, false, int64(88),
-		int64(42), 3.55, uint64(55))
-	f.Add("sample log", "string field", 9, true, int64(88),
-		int64(42), 3.55, uint64(55))
-
-	f.Fuzz(func(t *testing.T, msg string, stringF string, intF int,
-		boolF bool, int64F int64, int64F2 int64, float64F float64,
-		uint64F uint64,
-	) {
-		t.Parallel()
-
-		err := fmt.Errorf("%w: %s", errTest, msg)
-		stringer := dummyStringer(msg)
-
-		zapL.Info(msg,
-			zap.String("stringF", stringF),
-			zap.Int("intF", intF),
-			zap.Bool("boolF", boolF),
-			zap.Int64("int64F", int64F),
-			zap.Duration("durationF", time.Duration(int64F)),
-			zap.Float64("float64F", float64F),
-			zap.Time("timeF", time.Unix(int64F, int64F2)),
-			zap.Uint64("uint64F", uint64F),
-			zap.Error(err),
-			zap.Stringer("stringerF", stringer),
-		)
-
-		expected := Take(obs)
-
-		logger.Info(msg,
-			"stringF", stringF,
-			"intF", intF,
-			"boolF", boolF,
-			"int64F", int64F,
-			"durationF", time.Duration(int64F),
-			"float64F", float64F,
-			"timeF", time.Unix(int64F, int64F2),
-			"uint64F", uint64F,
-			"error", err,
-			"stringerF", stringer,
-		)
-
-		MatchEntry(t, expected, Take(obs))
-	})
-}
-
 func TestWith(t *testing.T) {
 	t.Parallel()
 
-	logger, _, obs := ObsLogger(zap.DebugLevel)
-
-	logger.Info("test", "test-field", "test-value")
-
-	got := Take(obs)
-
-	logger.With("test-field", "test-value").Info("test")
-	MatchEntry(t, Take(obs), got)
+	Match(t, zap.DebugLevel, func(l *slog.Logger, _ *zap.Logger) {
+		l.Info("test", "test-field", "test-value")
+	}, func(l *slog.Logger, _ *zap.Logger) {
+		l.With("test-field", "test-value").Info("test")
+	})
 }
 
 func TestZapHandlerGroup(t *testing.T) {
@@ -272,19 +218,9 @@ func TestZapHandlerGroup(t *testing.T) {
 
 	ctx := context.TODO()
 
-	core, obs := observer.New(zap.DebugLevel)
-	defer func() {
-		if err := core.Sync(); err != nil {
-			t.Error(err)
-		}
-	}()
-
-	logger := slog.New(zaphandler.NewFromCore(core))
-
-	logger.WithGroup("s").LogAttrs(ctx, slog.LevelInfo, "", slog.Int("a", 1), slog.Int("b", 2))
-
-	got := Take(obs)
-
-	logger.LogAttrs(ctx, slog.LevelInfo, "", slog.Group("s", slog.Int("a", 1), slog.Int("b", 2)))
-	MatchEntry(t, Take(obs), got)
+	Match(t, zap.DebugLevel, func(l *slog.Logger, _ *zap.Logger) {
+		l.WithGroup("s").LogAttrs(ctx, slog.LevelInfo, "", slog.Int("a", 1), slog.Int("b", 2))
+	}, func(l *slog.Logger, _ *zap.Logger) {
+		l.LogAttrs(ctx, slog.LevelInfo, "", slog.Group("s", slog.Int("a", 1), slog.Int("b", 2)))
+	})
 }

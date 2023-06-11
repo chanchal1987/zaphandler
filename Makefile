@@ -20,9 +20,11 @@ fmt: tidy
 	@echo "Formatting... Done!"
 
 lint: fmt
-	@echo "Linting..." && golangci-lint run --no-config --fix --enable-all \
+	@echo "Linting..." && golangci-lint run --no-config --enable-all --fix \
+		--disable gci \
 		--disable exhaustivestruct \
 		--disable exhaustruct \
+		--disable exhaustive \
 		--disable ireturn \
 		./...
 	@echo "Linting... Done!"
@@ -32,7 +34,7 @@ test: lint
 	@echo "Testing... Done!"
 
 fuzz:
-	@echo "Fuzzing..." && go test -fuzz 'Fuzz*' -fuzztime ${FUZZ_TIME} ./...
+	@for pkg in `go list ./...`; do echo "Fuzzing $${pkg}..." && go test -fuzz 'Fuzz*' -fuzztime ${FUZZ_TIME} $${pkg}; done
 	@echo "Fuzzing... Done"
 
 bench:

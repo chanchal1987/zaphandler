@@ -2,7 +2,6 @@ package zaphandler
 
 import (
 	"context"
-
 	"log/slog"
 )
 

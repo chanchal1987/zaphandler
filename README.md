@@ -1,6 +1,6 @@
 # zaphandler
 
-zaphandler will help to create [slog handler](https://pkg.go.dev/golang.org/x/exp/slog#Handler) using [zap logger](https://pkg.go.dev/go.uber.org/zap) [![Go Reference](https://pkg.go.dev/badge/go.mrchanchal.com/zaphandler.svg)](https://pkg.go.dev/go.mrchanchal.com/zaphandler) [![Report Card](https://goreportcard.com/badge/go.mrchanchal.com/zaphandler)](https://goreportcard.com/report/go.mrchanchal.com/zaphandler)
+zaphandler will help to create [slog handler](https://pkg.go.dev/log/slog#Handler) using [zap logger](https://pkg.go.dev/go.uber.org/zap) [![Go Reference](https://pkg.go.dev/badge/go.mrchanchal.com/zaphandler.svg)](https://pkg.go.dev/go.mrchanchal.com/zaphandler) [![Report Card](https://goreportcard.com/badge/go.mrchanchal.com/zaphandler)](https://goreportcard.com/report/go.mrchanchal.com/zaphandler)
 
 ## Example:
 
